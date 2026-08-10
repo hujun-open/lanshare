@@ -97,7 +97,7 @@ in
 
     networking.firewall = {
       allowedTCPPorts =
-        if config.services.lanshare.openFirewall then [ config.services.lanshare.port ] else null;
+        if config.services.lanshare.openFirewall then [ config.services.lanshare.guiPort ] else null;
       allowedUDPPorts =
         if config.services.lanshare.openFirewall && config.services.lanshare.stunPort != 0 then
           [ config.services.lanshare.stunPort ]
