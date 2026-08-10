@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>LanShare</title>
+<link rel="stylesheet" href="/css/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#128225;</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">LanShare</span>
+  </div>
+  <div class="topbar-right">
+    <span id="status" class="status status-connecting">Connecting</span>
+    <a class="ghost-link" href="/diag">Diagnostics</a>
+  </div>
+</header>
+
+<main>
+  <section class="identity">
+    <p class="identity-line">
+      You are <button id="self-name" class="name-button" title="Click to rename">&hellip;</button>
+      <span id="self-subnet" class="muted"></span>
+    </p>
+  </section>
+
+  <section class="peers" aria-labelledby="peers-heading">
+    <h2 id="peers-heading">Devices on your network</h2>
+    <div id="peer-grid" class="peer-grid"></div>
+    <div id="empty-state" class="empty-state">
+      <p class="empty-title">Waiting for another device</p>
+      <p>Open one of these addresses in a browser on the other machine:</p>
+      <ul id="server-urls" class="url-list"></ul>
+      <p class="muted small">Both devices must be on the same subnet to see each other.</p>
+    </div>
+  </section>
+
+  <section id="transfers-section" class="transfers hidden" aria-labelledby="transfers-heading">
+    <h2 id="transfers-heading">Transfers</h2>
+    <ul id="transfer-list" class="transfer-list"></ul>
+  </section>
+
+  <section id="inbox-section" class="inbox hidden" aria-labelledby="inbox-heading">
+    <h2 id="inbox-heading">Received text</h2>
+    <ul id="inbox-list" class="inbox-list"></ul>
+  </section>
+</main>
+
+<div id="toast-stack" class="toast-stack" role="status" aria-live="polite"></div>
+
+<!-- Incoming transfer confirmation -->
+<dialog id="accept-dialog" class="dialog">
+  <form method="dialog">
+    <h3 id="accept-title">Incoming files</h3>
+    <p id="accept-summary" class="muted"></p>
+    <ul id="accept-files" class="file-list"></ul>
+    <menu class="dialog-actions">
+      <button value="decline" class="button">Decline</button>
+      <button value="accept" class="button primary" autofocus>Accept</button>
+    </menu>
+  </form>
+</dialog>
+
+<!-- Text composer -->
+<dialog id="text-dialog" class="dialog">
+  <form method="dialog">
+    <h3>Send text to <span id="text-target"></span></h3>
+    <textarea id="text-body" rows="6" placeholder="Type or paste anything&hellip;"></textarea>
+    <menu class="dialog-actions">
+      <button value="cancel" class="button">Cancel</button>
+      <button value="send" class="button primary">Send</button>
+    </menu>
+  </form>
+</dialog>
+
+<template id="peer-tile-template">
+  <article class="peer-tile" tabindex="0">
+    <div class="peer-icon" data-role="icon" aria-hidden="true"></div>
+    <h3 class="peer-name" data-role="name"></h3>
+    <span class="peer-badge" data-role="badge">Ready</span>
+    <div class="peer-actions">
+      <button class="button small" data-role="send-files">Send files</button>
+      <button class="button small" data-role="send-text">Send text</button>
+    </div>
+    <div class="peer-drop-hint" data-role="drop-hint">Drop to send</div>
+  </article>
+</template>
+
+<template id="transfer-item-template">
+  <li class="transfer">
+    <div class="transfer-head">
+      <span class="transfer-name" data-role="name"></span>
+      <span class="transfer-meta" data-role="meta"></span>
+    </div>
+    <div class="progress"><div class="progress-bar" data-role="bar"></div></div>
+    <div class="transfer-foot">
+      <span data-role="detail" class="muted small"></span>
+      <span data-role="path" class="path-badge"></span>
+    </div>
+  </li>
+</template>
+
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>

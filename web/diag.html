@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>LanShare diagnostics</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">LanShare diagnostics</span>
+  </div>
+  <div class="topbar-right">
+    <a class="ghost-link" href="/">Back to transfers</a>
+  </div>
+</header>
+
+<main>
+  <div class="diag-grid">
+
+    <section class="card">
+      <h2>Can this browser connect directly?</h2>
+      <div id="ice-verdict" class="verdict pending">Gathering ICE candidates&hellip;</div>
+      <p class="muted small">
+        This tests what address information your browser can gather. Real IP addresses mean a
+        direct peer-to-peer transfer needs no multicast. Only <code>.local</code> names means
+        the browser is hiding your address behind mDNS, which needs multicast UDP 5353 to work
+        on both machines.
+      </p>
+      <table class="cands">
+        <thead><tr><th>Type</th><th>Address</th><th>Protocol</th></tr></thead>
+        <tbody id="ice-rows"></tbody>
+      </table>
+      <p><button id="rerun" class="button small">Run again</button></p>
+    </section>
+
+    <section class="card">
+      <h2>This browser</h2>
+      <dl class="kv" id="client-info"></dl>
+    </section>
+
+    <section class="card">
+      <h2>Server</h2>
+      <dl class="kv" id="server-info"></dl>
+    </section>
+
+    <section class="card">
+      <h2>Rooms</h2>
+      <p class="muted small">Peers are grouped by subnet. Two devices can only see each other if they land in the same room.</p>
+      <div id="rooms"></div>
+    </section>
+
+  </div>
+</main>
+
+<script type="module" src="/js/diag.js"></script>
+</body>
+</html>
