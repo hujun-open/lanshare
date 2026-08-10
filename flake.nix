@@ -20,19 +20,7 @@
           pkgs = import nixpkgs { inherit system; };
         in
         {
-          default = pkgs.buildGoModule {
-            pname = "lanshare";
-            version = "0.1.0";
-
-            src = ./.;
-            vendorHash = "sha256-hTYQJTrrYO+dQL/Hl64xcaMILJUkjwD/PW0w8Lkf91E=";
-
-            meta = {
-              description = "a local file/text sharing web app over LAN";
-              homepage = "https://github.com/hujun-open/lanshare";
-              license = pkgs.lib.licenses.mit;
-            };
-          };
+          default = pkgs.callPackage ./daemon-derivation.nix { };
         }
       );
 
@@ -42,5 +30,7 @@
           program = "${self.packages.${system}.default}/bin/lanshare";
         };
       });
+
+      nixosModules.lanshare = ./nixos-module.nix;
     };
 }
