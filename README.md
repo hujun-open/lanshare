@@ -1,9 +1,10 @@
 # LanShare
 
-Send files and text between two browsers on the same LAN. One machine runs a
-single self-contained binary; the other devices just open a web page. Transfers
+Send files and text between two browsers on the same LAN.Transfers
 go directly peer-to-peer over WebRTC, and fall back to relaying through the
 server when a firewall blocks the direct path.
+
+run lanshare on a separated server, or on one of file transferring peer. 
 
 No installation on the client devices, no cloud, no accounts, no build step.
 
@@ -31,7 +32,7 @@ appear as tiles. Click a tile or drag files onto it to send.
 
 ## How it works
 
-Three roles. **S** runs the binary and is the only machine that needs open
+Three roles. **S** runs the lanshare and is the only machine that needs open
 inbound ports. **A** and **B** are the devices exchanging files; they only ever
 run a browser and only ever make outbound connections.
 
