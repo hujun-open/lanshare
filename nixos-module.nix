@@ -61,8 +61,8 @@ in
         Type = "simple";
         User = "lanshare";
         Group = "lanshare";
-        ExecStart =
-          lib.escapeShellArgs [
+        ExecStart = lib.escapeShellArgs (
+          [
             "${lanshare}/bin/lanshare"
             "--addr"
             config.services.lanshare.host
@@ -88,7 +88,8 @@ in
               ]
             else
               [ ]
-          );
+          )
+        );
       };
 
       wantedBy = [ "multi-user.target" ];
