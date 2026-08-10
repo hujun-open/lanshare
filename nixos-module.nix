@@ -46,7 +46,7 @@ in
         Type = "simple";
         User = "lanshare";
         Group = "lanshare";
-        ExecStart = "${lanshare}/bin/lanshare --addr ${config.services.lanshare.host} --port ${config.services.lanshare.port}";
+        ExecStart = "${lanshare}/bin/lanshare --addr ${config.services.lanshare.host} --port ${toString config.services.lanshare.port}";
       };
 
       wantedBy = [ "multi-user.target" ];
