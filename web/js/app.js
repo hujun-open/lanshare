@@ -16,7 +16,7 @@ const identity = loadIdentity();
 
 const ui = new UI({
   onSendFiles: (peerId, files) => sendFiles(peerId, files),
-  onSendText: (peerId, text) => sendText(peerId, text),
+  onSendMessage: (peerId, message) => sendMessage(peerId, message),
   onRename: (name) => rename(name),
 });
 
@@ -139,6 +139,7 @@ class PeerLink {
       peerId,
       acquireTransport: () => this.acquire(),
       confirmIncoming: (files) => ui.confirmIncoming(files, peerId),
+      confirmDoc: (size) => ui.confirmDoc(size, peerId),
     });
 
     this.conversation.addEventListener('transfer-start', (e) => ui.transferStart(e.detail));
@@ -146,6 +147,7 @@ class PeerLink {
     this.conversation.addEventListener('transfer-done', (e) => ui.transferDone(e.detail));
     this.conversation.addEventListener('transfer-error', (e) => ui.transferError(e.detail));
     this.conversation.addEventListener('text', (e) => ui.addText(e.detail.peerId, e.detail.body, e.detail.ts));
+    this.conversation.addEventListener('rich', (e) => ui.addRich(e.detail.peerId, e.detail));
     this.conversation.addEventListener('declined', () => {
       ui.toast(`${ui.peerName(peerId)} declined the transfer.`);
     });
@@ -265,9 +267,16 @@ async function sendFiles(peerId, files) {
   }
 }
 
-async function sendText(peerId, text) {
+/** A composed message: formatted when the user pasted rich content, else text. */
+async function sendMessage(peerId, { text, html }) {
+  const conversation = linkFor(peerId).conversation;
   try {
-    await linkFor(peerId).conversation.sendText(text);
+    if (html) {
+      await conversation.sendDoc({ html, text });
+      ui.toast(`Formatted text sent to ${ui.peerName(peerId)}`, 'success');
+      return;
+    }
+    await conversation.sendText(text);
     ui.toast(`Text sent to ${ui.peerName(peerId)}`, 'success');
   } catch (err) {
     ui.toast(err.message, 'error');
