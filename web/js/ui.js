@@ -1,7 +1,14 @@
 // All DOM work lives here. Values that came from another peer are only ever
 // written with textContent, never as HTML.
+//
+// Formatted messages are the one exception, and they are kept at arm's length:
+// the markup is sanitized again on arrival and then rendered inside an iframe
+// with no allow-scripts and no allow-same-origin, so it runs no code and cannot
+// see this page. It is never inserted into this document.
 
-import { canStreamToDisk, safeFileName } from './transfer.js';
+import { canStreamToDisk, safeFileName, triggerDownload } from './transfer.js';
+import { hasFormatting, sanitizeHtml } from './sanitize.js';
+import { buildDocument, capturePaste, imageFileToTag, prepareRichPaste } from './rich.js';
 
 const DEVICE_ICONS = {
   desktop: '\u{1F5A5}\u{FE0F}',
@@ -11,6 +18,13 @@ const DEVICE_ICONS = {
 };
 
 const MAX_TRANSFER_ROWS = 40;
+
+// A pasted message under this size gets no row in the transfer list: it behaves
+// like a message, and the inbox item it produces is the feedback that matters.
+const QUIET_DOC_BYTES = 256 * 1024;
+
+// How much markup the source view will show before it stops being useful.
+const SOURCE_VIEW_LIMIT = 200 * 1024;
 
 export function formatBytes(bytes) {
   if (!Number.isFinite(bytes)) return '?';
@@ -67,9 +81,92 @@ async function copyToClipboard(text, selectEl) {
   if (!ok) throw new Error('copy failed');
 }
 
+/** Puts both flavours on the clipboard so a paste elsewhere keeps formatting. */
+async function copyRichToClipboard(html, text) {
+  if (window.ClipboardItem && navigator.clipboard?.write) {
+    await navigator.clipboard.write([new ClipboardItem({
+      'text/html': new Blob([html], { type: 'text/html' }),
+      'text/plain': new Blob([text], { type: 'text/plain' }),
+    })]);
+    return;
+  }
+  // Off a secure context there is no rich clipboard at all, so plain text is
+  // the most that can be offered.
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  throw new Error('no clipboard access');
+}
+
+/**
+ * Inserts already-sanitized markup at the caret. execCommand is deprecated but
+ * is still the only way to leave the browser's own undo history intact.
+ */
+function insertHtmlAtCaret(el, html) {
+  el.focus();
+  try {
+    if (document.execCommand('insertHTML', false, html)) return;
+  } catch { /* fall through to the manual path */ }
+
+  const parsed = new DOMParser().parseFromString(html, 'text/html');
+  const fragment = document.createDocumentFragment();
+  for (const node of Array.from(parsed.body.childNodes)) {
+    fragment.appendChild(document.importNode(node, true));
+  }
+  insertNodeAtCaret(el, fragment);
+}
+
+function insertTextAtCaret(el, text) {
+  if (!text) return;
+  el.focus();
+  try {
+    if (document.execCommand('insertText', false, text)) return;
+  } catch { /* fall through to the manual path */ }
+  // The composer is styled with pre-wrap, so newlines in a text node render.
+  insertNodeAtCaret(el, document.createTextNode(text));
+}
+
+function insertNodeAtCaret(el, node) {
+  const selection = window.getSelection();
+  const range = selection?.rangeCount ? selection.getRangeAt(0) : null;
+  if (!range || !el.contains(range.commonAncestorContainer)) {
+    el.appendChild(node);
+    return;
+  }
+  range.deleteContents();
+  range.insertNode(node);
+  range.collapse(false);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+function button(label, onClick) {
+  const el = document.createElement('button');
+  el.className = 'button small';
+  el.textContent = label;
+  el.addEventListener('click', onClick);
+  return el;
+}
+
+function flash(el, label) {
+  const original = el.textContent;
+  el.textContent = label;
+  setTimeout(() => { el.textContent = original; }, 1500);
+}
+
+function fileStamp(ts) {
+  return new Date(ts ?? Date.now()).toISOString().replace(/[:.]/g, '-').slice(0, 19);
+}
+
 export class UI {
   #peers = new Map();
   #transfers = new Map();
+  // Pastes are embedded asynchronously, so sending is held back until every
+  // one of them has settled.
+  #pastesInFlight = 0;
+  #composerNote = '';
+  #composerResult = null;
 
   constructor(handlers) {
     this.handlers = handlers;
@@ -92,7 +189,13 @@ export class UI {
     this.tileTemplate = document.getElementById('peer-tile-template');
     this.transferTemplate = document.getElementById('transfer-item-template');
 
+    this.composerEl = document.getElementById('text-body');
+    this.composerNoteEl = document.getElementById('text-note');
+    this.textSendBtn = document.getElementById('text-send');
+    this.clearFormatBtn = document.getElementById('text-clear-format');
+
     this.selfNameEl.addEventListener('click', () => this.#renameSelf());
+    this.#wireComposer();
 
     // One hidden input, reused for every "send files" action.
     this.filePicker = document.createElement('input');
@@ -216,8 +319,8 @@ export class UI {
     sendFilesBtn.addEventListener('click', (e) => { e.stopPropagation(); pickFiles(); });
     sendTextBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
-      const body = await this.promptText(peer.id);
-      if (body) this.handlers.onSendText(peer.id, body);
+      const message = await this.promptText(peer.id);
+      if (message) this.handlers.onSendMessage(peer.id, message);
     });
     el.addEventListener('click', pickFiles);
     el.addEventListener('keydown', (e) => {
@@ -254,7 +357,11 @@ export class UI {
 
   // ---------------------------------------------------------- transfers
 
-  transferStart({ id, direction, name, size, peerId, path }) {
+  transferStart({ id, direction, name, size, peerId, path, role }) {
+    // A short pasted message is a message, not a transfer. The inbox item it
+    // produces is the feedback that matters, so a progress row would be noise.
+    if (role === 'doc' && size < QUIET_DOC_BYTES) return;
+
     const el = this.transferTemplate.content.firstElementChild.cloneNode(true);
     const refs = {
       el,
@@ -292,12 +399,16 @@ export class UI {
     this.#setPathBadge(refs.pathEl, path);
   }
 
-  transferDone({ id, direction, name }) {
+  transferDone({ id, direction, name, role }) {
     const refs = this.#transfers.get(id);
     if (!refs) return;
     refs.el.classList.add('done');
     refs.barEl.style.width = '100%';
-    refs.detailEl.textContent = direction === 'send' ? 'Sent' : 'Saved';
+    if (direction === 'send') refs.detailEl.textContent = 'Sent';
+    else refs.detailEl.textContent = role === 'doc' ? 'Shown below' : 'Saved';
+    // A message announces itself when it is sent or when it appears in the
+    // inbox, so a second toast about the transfer behind it is just noise.
+    if (role === 'doc') return;
     this.toast(`${direction === 'send' ? 'Sent' : 'Received'} ${name}`, 'success');
   }
 
@@ -319,7 +430,7 @@ export class UI {
 
   // -------------------------------------------------------------- inbox
 
-  addText(peerId, body, ts) {
+  #inboxItem(peerId, ts) {
     const item = document.createElement('li');
     item.className = 'inbox-item';
 
@@ -329,28 +440,112 @@ export class UI {
     who.className = 'muted small';
     const when = ts ? new Date(ts) : new Date();
     who.textContent = `From ${this.peerName(peerId)} at ${when.toLocaleTimeString()}`;
+
+    const actions = document.createElement('div');
+    actions.className = 'inbox-actions';
+    head.append(who, actions);
+    item.append(head);
+
+    return { item, actions };
+  }
+
+  #showInboxItem(item) {
+    this.inboxListEl.prepend(item);
+    this.inboxSection.classList.remove('hidden');
+  }
+
+  addText(peerId, body, ts) {
+    const { item, actions } = this.#inboxItem(peerId, ts);
+
     const pre = document.createElement('pre');
     pre.className = 'inbox-body';
     pre.textContent = body;
 
-    const copy = document.createElement('button');
-    copy.className = 'button small';
-    copy.textContent = 'Copy';
-    copy.addEventListener('click', async () => {
+    const copy = button('Copy', async () => {
       try {
         await copyToClipboard(body, pre);
-        copy.textContent = 'Copied';
-        setTimeout(() => { copy.textContent = 'Copy'; }, 1500);
+        flash(copy, 'Copied');
       } catch {
         this.toast('Clipboard access was blocked; select the text and copy it manually.', 'error');
       }
     });
-    head.append(who, copy);
+    actions.append(copy);
 
-    item.append(head, pre);
-    this.inboxListEl.prepend(item);
-    this.inboxSection.classList.remove('hidden');
+    item.append(pre);
+    this.#showInboxItem(item);
     this.toast(`Text received from ${this.peerName(peerId)}`, 'success');
+  }
+
+  /**
+   * Renders a formatted message. The markup was sanitized by the sender, which
+   * proves nothing, so it is sanitized again here and then handed to an iframe
+   * that has neither allow-scripts nor allow-same-origin: an opaque origin with
+   * scripting off, under a default-src 'none' policy. Popups are the one thing
+   * allowed, so that a link the reader clicks can still open in a real tab.
+   */
+  addRich(peerId, { html, text, ts }) {
+    const safe = sanitizeHtml(html);
+    if (!safe) {
+      // Nothing survived sanitizing, so the plain alternative is all there is.
+      this.addText(peerId, text ?? '', ts);
+      return;
+    }
+
+    const { item, actions } = this.#inboxItem(peerId, ts);
+
+    const frame = document.createElement('iframe');
+    frame.className = 'rich-frame';
+    frame.setAttribute('sandbox', 'allow-popups allow-popups-to-escape-sandbox');
+    frame.setAttribute('referrerpolicy', 'no-referrer');
+    frame.title = `Formatted message from ${this.peerName(peerId)}`;
+    frame.srcdoc = buildDocument(safe);
+
+    const source = document.createElement('pre');
+    source.className = 'inbox-body hidden';
+    // Filled on demand: with images inlined the markup runs to megabytes, and
+    // laying all of that out as text costs more than it is worth up front.
+    const fillSource = () => {
+      if (source.textContent) return;
+      source.textContent = safe.length > SOURCE_VIEW_LIMIT
+        ? `${safe.slice(0, SOURCE_VIEW_LIMIT)}\n\u2026 truncated, use Save as .html for all of it`
+        : safe;
+    };
+
+    const copy = button('Copy', async () => {
+      try {
+        await copyRichToClipboard(safe, text ?? '');
+        flash(copy, 'Copied');
+      } catch {
+        fillSource();
+        source.classList.remove('hidden');
+        this.toast('Clipboard access was blocked; the source is shown below to copy by hand.', 'error');
+      }
+    });
+
+    const save = button('Save as .html', () => {
+      triggerDownload(
+        new Blob([buildDocument(safe)], { type: 'text/html' }),
+        `pasted-${fileStamp(ts)}.html`,
+      );
+    });
+
+    // Nothing scripts inside the frame, so its content cannot report how tall it
+    // is. It gets a fixed box that scrolls, and a taller one on request.
+    const expand = button('Expand', () => {
+      const tall = frame.classList.toggle('tall');
+      expand.textContent = tall ? 'Shrink' : 'Expand';
+    });
+
+    const viewSource = button('Source', () => {
+      fillSource();
+      const hidden = source.classList.toggle('hidden');
+      viewSource.textContent = hidden ? 'Source' : 'Hide source';
+    });
+
+    actions.append(copy, save, expand, viewSource);
+    item.append(frame, source);
+    this.#showInboxItem(item);
+    this.toast(`Formatted text received from ${this.peerName(peerId)}`, 'success');
   }
 
   // ------------------------------------------------------------ dialogs
@@ -407,20 +602,152 @@ export class UI {
     });
   }
 
+  /**
+   * Asks about a large formatted message. Small ones are accepted without a
+   * prompt, but once embedded images make it file-sized it deserves the same
+   * question a file gets. Never picks a save location: it is rendered, not
+   * written to disk.
+   */
+  confirmDoc(size, peerId) {
+    document.getElementById('accept-title').textContent = 'Incoming formatted text';
+    document.getElementById('accept-summary').textContent =
+      `${this.peerName(peerId)} wants to send ${formatBytes(size)} of formatted text and embedded images.`;
+    document.getElementById('accept-files').replaceChildren();
+
+    return new Promise((resolve) => {
+      const onClose = () => {
+        this.acceptDialog.removeEventListener('close', onClose);
+        resolve(this.acceptDialog.returnValue === 'accept');
+      };
+      this.acceptDialog.returnValue = '';
+      this.acceptDialog.addEventListener('close', onClose);
+      this.acceptDialog.showModal();
+    });
+  }
+
+  // ----------------------------------------------------------- composer
+
+  #wireComposer() {
+    this.composerEl.addEventListener('paste', (e) => this.#onComposerPaste(e));
+    this.composerEl.addEventListener('input', () => this.#renderComposerState());
+    this.composerEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+        e.preventDefault();
+        this.textSendBtn.click();
+      }
+    });
+
+    this.clearFormatBtn.addEventListener('click', () => {
+      const plain = this.composerEl.innerText;
+      this.composerEl.textContent = plain;
+      this.#composerNote = '';
+      this.#renderComposerState();
+      this.composerEl.focus();
+    });
+
+    // The content has to be read while the dialog is still on screen: innerText
+    // depends on layout, and once the dialog closes it collapses to the
+    // textContent of the whole thing with every line break lost.
+    this.textSendBtn.addEventListener('click', () => {
+      this.#composerResult = this.#readComposer();
+    });
+  }
+
+  /**
+   * Everything that lands in the composer comes through here, so nothing
+   * unvetted is ever inserted into this page. The clipboard's HTML flavour is
+   * sanitized and has its images embedded; a screenshot arrives as a file with
+   * no HTML at all; anything else is inserted as plain text.
+   */
+  async #onComposerPaste(event) {
+    event.preventDefault();
+    const { html, text, files } = capturePaste(event.clipboardData);
+
+    if (!html && files.length > 0) {
+      await this.#whilePreparing(async () => {
+        for (const file of files) {
+          try {
+            insertHtmlAtCaret(this.composerEl, await imageFileToTag(file));
+          } catch (err) {
+            this.toast(`That image could not be pasted: ${err.message}`, 'error');
+          }
+        }
+        return true;
+      });
+      return;
+    }
+
+    if (html) {
+      const inserted = await this.#whilePreparing(async () => {
+        const prepared = await prepareRichPaste(html);
+        if (!prepared.html) return false;
+        insertHtmlAtCaret(this.composerEl, prepared.html);
+        this.#composerNote = prepared.dropped > 0
+          ? `${prepared.dropped} image${prepared.dropped === 1 ? '' : 's'} could not be embedded and ${prepared.dropped === 1 ? 'was' : 'were'} left out.`
+          : '';
+        return true;
+      });
+      if (inserted) return;
+    }
+
+    insertTextAtCaret(this.composerEl, text);
+    this.#renderComposerState();
+  }
+
+  async #whilePreparing(work) {
+    this.#pastesInFlight += 1;
+    this.#renderComposerState();
+    try {
+      return await work();
+    } catch (err) {
+      this.toast(`That paste could not be prepared: ${err.message}`, 'error');
+      return false;
+    } finally {
+      this.#pastesInFlight -= 1;
+      this.#renderComposerState();
+    }
+  }
+
+  #renderComposerState() {
+    const busy = this.#pastesInFlight > 0;
+    this.composerNoteEl.textContent = busy ? 'Embedding images\u2026' : this.#composerNote;
+    this.textSendBtn.disabled = busy;
+    this.clearFormatBtn.classList.toggle('hidden', !hasFormatting(this.composerEl));
+  }
+
+  /** Snapshot of the composer: `html` is null when the content is plain text. */
+  #readComposer() {
+    const el = this.composerEl;
+    // Word and browsers paste plenty of non-breaking spaces, which look like
+    // ordinary spaces but survive as U+00A0 in the plain-text alternative.
+    const text = el.innerText.replace(/\u00a0/g, ' ');
+    if (!hasFormatting(el)) {
+      return text.trim() ? { text, html: null } : null;
+    }
+    // Sanitized once more on the way out. What is in the editor was vetted on
+    // paste, but this is the copy that leaves the machine.
+    const html = sanitizeHtml(el.innerHTML);
+    if (!html) return text.trim() ? { text, html: null } : null;
+    return { text, html };
+  }
+
+  /** Resolves `{ text, html }`, or null when nothing was sent. */
   promptText(peerId) {
     document.getElementById('text-target').textContent = this.peerName(peerId);
-    const body = document.getElementById('text-body');
-    body.value = '';
+    this.composerEl.replaceChildren();
+    this.#composerNote = '';
+    this.#composerResult = null;
+    this.#renderComposerState();
 
     return new Promise((resolve) => {
       const onClose = () => {
         this.textDialog.removeEventListener('close', onClose);
-        resolve(this.textDialog.returnValue === 'send' ? body.value : null);
+        resolve(this.textDialog.returnValue === 'send' ? this.#composerResult : null);
       };
       this.textDialog.returnValue = '';
       this.textDialog.addEventListener('close', onClose);
       this.textDialog.showModal();
-      body.focus();
+      this.composerEl.focus();
     });
   }
 

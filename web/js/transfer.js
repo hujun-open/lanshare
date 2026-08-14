@@ -4,12 +4,27 @@
 //
 // Control messages are strings and payload is binary, which is enough framing
 // on an ordered reliable stream: an "fstart" marks which file the following
-// chunks belong to, and "fend" closes it.
+// chunks belong to, and "fend" closes it. A pasted document uses "dstart" and
+// "dend" the same way, because rich content with its images inlined runs to
+// megabytes and a data channel refuses any single message over 256 KB.
+
+import { MAX_DOC_BYTES } from './rich.js';
 
 export const CHUNK_SIZE = 64 * 1024;
 
 // Sampling window for the live throughput readout.
 const RATE_SAMPLE_MS = 250;
+
+// What a received document is called in the transfer list and in saved files.
+const DOC_NAME = 'Pasted page';
+
+// A rich message this small is a message, not a transfer, so asking the user to
+// approve it would be noise. Anything larger is confirmed like a file.
+const AUTO_ACCEPT_DOC_BYTES = 2 * 1024 * 1024;
+
+// The plain-text alternative rides along in the dstart message, so it has to
+// stay well inside the smallest single-message limit of the two transports.
+const PLAIN_FALLBACK_LIMIT = 32 * 1024;
 
 /** Tracks throughput without letting a single slow chunk swing the readout. */
 class RateMeter {
@@ -67,6 +82,38 @@ class BlobSink {
   }
 }
 
+/**
+ * Keeps a document in memory and hands it back as text, since a pasted page is
+ * meant to be rendered in the inbox rather than saved. Bounded by the size the
+ * receiver agreed to in dstart.
+ */
+class MemorySink {
+  #parts = [];
+
+  async write(chunk) {
+    this.#parts.push(new Uint8Array(chunk));
+  }
+
+  async finish() {
+    let total = 0;
+    for (const part of this.#parts) total += part.byteLength;
+    const joined = new Uint8Array(total);
+    let at = 0;
+    for (const part of this.#parts) {
+      joined.set(part, at);
+      at += part.byteLength;
+    }
+    this.#parts = [];
+    // Decoding once at the end rather than per chunk, because a multi-byte
+    // character can straddle a chunk boundary.
+    return new TextDecoder().decode(joined);
+  }
+
+  async abort() {
+    this.#parts = [];
+  }
+}
+
 /** Streams straight to a file the user chose. Needs a secure context. */
 class StreamSink {
   constructor(meta, writable) {
@@ -92,7 +139,7 @@ export function canStreamToDisk() {
   return typeof window.showSaveFilePicker === 'function' && window.isSecureContext;
 }
 
-function triggerDownload(blob, name) {
+export function triggerDownload(blob, name) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement('a');
   anchor.href = url;
@@ -121,11 +168,14 @@ function newId(prefix) {
  * assembly machine.
  *
  * Events: transfer-start, transfer-progress, transfer-done, transfer-error,
- * text, declined.
+ * text, rich, declined.
  */
 export class Conversation extends EventTarget {
   #inboundBatch = null;
-  #inboundFile = null;
+  // Files and documents share one inbound slot. That is safe because chunks
+  // carry no identity of their own: each side serialises its own outbound
+  // stream, so only one can be open in a given direction at a time.
+  #inbound = null;
   #pendingDecision = null;
   #pendingAcks = new Map();
   #sending = false;
@@ -136,12 +186,14 @@ export class Conversation extends EventTarget {
    * @param {string} options.peerId
    * @param {() => Promise<object>} options.acquireTransport resolves a connected transport
    * @param {(files, peerId) => Promise<{accepted: boolean, handle?: any}>} options.confirmIncoming
+   * @param {(size: number, peerId: string) => Promise<boolean>} [options.confirmDoc]
    */
-  constructor({ peerId, acquireTransport, confirmIncoming }) {
+  constructor({ peerId, acquireTransport, confirmIncoming, confirmDoc }) {
     super();
     this.peerId = peerId;
     this.acquireTransport = acquireTransport;
     this.confirmIncoming = confirmIncoming;
+    this.confirmDoc = confirmDoc ?? (() => Promise.resolve(true));
   }
 
   /** Routes a transport's messages here. Both paths may be attached at once. */
@@ -158,6 +210,72 @@ export class Conversation extends EventTarget {
   async sendText(body) {
     const transport = await this.acquireTransport();
     transport.send(JSON.stringify({ k: 'text', id: newId('t'), body, ts: Date.now() }));
+  }
+
+  /**
+   * Sends a sanitized HTML fragment as a document, with a plain-text
+   * alternative for the receiver's clipboard. Takes the same lock as a file
+   * batch, since two chunk streams in one direction would interleave.
+   *
+   * @param {{html: string, text?: string}} doc
+   */
+  async sendDoc({ html, text = '' }) {
+    if (this.#sending) {
+      throw new Error('a transfer to this device is already running');
+    }
+    this.#sending = true;
+    try {
+      await this.#runDoc(html, text);
+    } finally {
+      this.#sending = false;
+    }
+  }
+
+  async #runDoc(html, text) {
+    const transport = await this.acquireTransport();
+    const blob = new Blob([html], { type: 'text/html' });
+    if (blob.size > MAX_DOC_BYTES) {
+      throw new Error('that is too much formatted content to send at once');
+    }
+
+    const id = newId('d');
+    const transferId = `doc:${id}`;
+
+    transport.send(JSON.stringify({
+      k: 'dstart',
+      id,
+      size: blob.size,
+      text: text.slice(0, PLAIN_FALLBACK_LIMIT),
+      ts: Date.now(),
+    }));
+
+    const accepted = await this.#awaitDecision(id);
+    if (!accepted) {
+      this.#emit('declined', { batchId: id });
+      return;
+    }
+
+    this.#emit('transfer-start', {
+      id: transferId, direction: 'send', name: DOC_NAME, size: blob.size,
+      peerId: this.peerId, path: transport.kind, role: 'doc',
+    });
+
+    try {
+      const meter = await this.#pump(transport, blob, transferId, () => this.#cancelled.has(id));
+      transport.send(JSON.stringify({ k: 'dend', id }));
+      await this.#awaitAck(id);
+
+      this.#emit('transfer-progress', {
+        id: transferId, transferred: blob.size, total: blob.size,
+        rate: meter.rate, eta: 0, path: transport.kind,
+      });
+      this.#emit('transfer-done', {
+        id: transferId, direction: 'send', name: DOC_NAME, role: 'doc',
+      });
+    } catch (err) {
+      this.#emit('transfer-error', { id: transferId, name: DOC_NAME, error: err.message });
+      throw err;
+    }
   }
 
   async sendFiles(fileList) {
@@ -210,7 +328,6 @@ export class Conversation extends EventTarget {
 
   async #sendOne(transport, file, meta, batchId) {
     const transferId = `${batchId}:${meta.id}`;
-    const meter = new RateMeter();
 
     this.#emit('transfer-start', {
       id: transferId, direction: 'send', name: meta.name, size: meta.size,
@@ -220,25 +337,9 @@ export class Conversation extends EventTarget {
     try {
       transport.send(JSON.stringify({ k: 'fstart', batchId, id: meta.id }));
 
-      let offset = 0;
-      while (offset < file.size) {
-        if (this.#cancelled.has(batchId)) throw new Error('cancelled');
-        await transport.waitUntilWritable();
-
-        const end = Math.min(offset + CHUNK_SIZE, file.size);
-        const chunk = await file.slice(offset, end).arrayBuffer();
-        transport.send(chunk);
-        offset = end;
-
-        // Bytes still sitting in the send buffer have not reached the peer, so
-        // subtracting them keeps the progress bar honest on both paths.
-        const settled = Math.max(0, offset - transport.bufferedAmount);
-        this.#emit('transfer-progress', {
-          id: transferId, transferred: settled, total: file.size,
-          rate: meter.update(settled), eta: meter.eta(settled, file.size),
-          path: transport.kind,
-        });
-      }
+      const meter = await this.#pump(
+        transport, file, transferId, () => this.#cancelled.has(batchId),
+      );
 
       transport.send(JSON.stringify({ k: 'fend', batchId, id: meta.id }));
       await this.#awaitAck(meta.id);
@@ -252,6 +353,33 @@ export class Conversation extends EventTarget {
       this.#emit('transfer-error', { id: transferId, name: meta.name, error: err.message });
       throw err;
     }
+  }
+
+  /** Chunks a blob onto the transport, reporting progress. Returns the meter. */
+  async #pump(transport, blob, transferId, isCancelled) {
+    const meter = new RateMeter();
+    let offset = 0;
+
+    while (offset < blob.size) {
+      if (isCancelled()) throw new Error('cancelled');
+      await transport.waitUntilWritable();
+
+      const end = Math.min(offset + CHUNK_SIZE, blob.size);
+      const chunk = await blob.slice(offset, end).arrayBuffer();
+      transport.send(chunk);
+      offset = end;
+
+      // Bytes still sitting in the send buffer have not reached the peer, so
+      // subtracting them keeps the progress bar honest on both paths.
+      const settled = Math.max(0, offset - transport.bufferedAmount);
+      this.#emit('transfer-progress', {
+        id: transferId, transferred: settled, total: blob.size,
+        rate: meter.update(settled), eta: meter.eta(settled, blob.size),
+        path: transport.kind,
+      });
+    }
+
+    return meter;
   }
 
   #awaitAck(fileId, timeoutMs = 120_000) {
@@ -287,6 +415,8 @@ export class Conversation extends EventTarget {
       case 'decline': this.#resolveDecision(msg.batchId, false); break;
       case 'fstart': this.#onFileStart(msg, transport); break;
       case 'fend': this.#onFileEnd(msg, transport); break;
+      case 'dstart': this.#onDocStart(msg, transport); break;
+      case 'dend': this.#onDocEnd(msg, transport); break;
       case 'received': this.#resolveAck(msg.id); break;
       case 'text': this.#emit('text', { body: msg.body, ts: msg.ts, peerId: this.peerId }); break;
       case 'cancel': this.#onRemoteCancel(); break;
@@ -352,8 +482,8 @@ export class Conversation extends EventTarget {
     }
 
     const transferId = `${msg.batchId}:${msg.id}`;
-    this.#inboundFile = {
-      meta, sink, transferId, received: 0, meter: new RateMeter(), transport,
+    this.#inbound = {
+      kind: 'file', meta, sink, transferId, received: 0, meter: new RateMeter(), transport,
     };
     this.#emit('transfer-start', {
       id: transferId, direction: 'receive', name: meta.name, size: meta.size,
@@ -361,9 +491,67 @@ export class Conversation extends EventTarget {
     });
   }
 
+  /**
+   * A document is held in memory, so the size agreed in dstart is a hard limit
+   * rather than a hint: a peer that keeps sending past it is cut off.
+   */
+  async #onDocStart(msg, transport) {
+    const id = typeof msg.id === 'string' ? msg.id : '';
+    const size = Number(msg.size);
+    if (!id) return;
+
+    if (!Number.isFinite(size) || size <= 0 || size > MAX_DOC_BYTES) {
+      transport.send(JSON.stringify({ k: 'decline', batchId: id }));
+      return;
+    }
+
+    if (size > AUTO_ACCEPT_DOC_BYTES) {
+      let accepted = false;
+      try {
+        accepted = await this.confirmDoc(size, this.peerId);
+      } catch {
+        accepted = false;
+      }
+      if (!accepted) {
+        transport.send(JSON.stringify({ k: 'decline', batchId: id }));
+        return;
+      }
+    }
+
+    const transferId = `doc:${id}`;
+    this.#inbound = {
+      kind: 'doc',
+      meta: { id, name: DOC_NAME, size, type: 'text/html' },
+      sink: new MemorySink(),
+      transferId,
+      received: 0,
+      meter: new RateMeter(),
+      transport,
+      text: typeof msg.text === 'string' ? msg.text : '',
+      ts: msg.ts,
+    };
+
+    this.#emit('transfer-start', {
+      id: transferId, direction: 'receive', name: DOC_NAME, size,
+      peerId: this.peerId, path: transport.kind, role: 'doc',
+    });
+    transport.send(JSON.stringify({ k: 'accept', batchId: id }));
+  }
+
   async #onChunk(buffer) {
-    const inbound = this.#inboundFile;
+    const inbound = this.#inbound;
     if (!inbound) return;
+
+    if (inbound.kind === 'doc' && inbound.received + buffer.byteLength > inbound.meta.size) {
+      this.#inbound = null;
+      await inbound.sink.abort();
+      this.#emit('transfer-error', {
+        id: inbound.transferId, name: inbound.meta.name,
+        error: 'the other device sent more than it announced',
+      });
+      return;
+    }
+
     await inbound.sink.write(buffer);
     inbound.received += buffer.byteLength;
     this.#emit('transfer-progress', {
@@ -376,10 +564,33 @@ export class Conversation extends EventTarget {
     });
   }
 
+  async #onDocEnd(msg, transport) {
+    const inbound = this.#inbound;
+    if (!inbound || inbound.kind !== 'doc' || inbound.meta.id !== msg.id) return;
+    this.#inbound = null;
+
+    try {
+      const html = await inbound.sink.finish();
+      transport.flushAck?.();
+      transport.send(JSON.stringify({ k: 'received', id: msg.id }));
+      this.#emit('rich', {
+        html, text: inbound.text, ts: inbound.ts, peerId: this.peerId,
+      });
+      this.#emit('transfer-done', {
+        id: inbound.transferId, direction: 'receive', name: DOC_NAME, role: 'doc',
+      });
+    } catch (err) {
+      await inbound.sink.abort();
+      this.#emit('transfer-error', {
+        id: inbound.transferId, name: DOC_NAME, error: err.message,
+      });
+    }
+  }
+
   async #onFileEnd(msg, transport) {
-    const inbound = this.#inboundFile;
-    if (!inbound || inbound.meta.id !== msg.id) return;
-    this.#inboundFile = null;
+    const inbound = this.#inbound;
+    if (!inbound || inbound.kind !== 'file' || inbound.meta.id !== msg.id) return;
+    this.#inbound = null;
 
     try {
       await inbound.sink.finish();
@@ -399,14 +610,14 @@ export class Conversation extends EventTarget {
   }
 
   async #onRemoteCancel() {
-    if (!this.#inboundFile) return;
-    await this.#inboundFile.sink.abort();
+    if (!this.#inbound) return;
+    await this.#inbound.sink.abort();
     this.#emit('transfer-error', {
-      id: this.#inboundFile.transferId,
-      name: this.#inboundFile.meta.name,
+      id: this.#inbound.transferId,
+      name: this.#inbound.meta.name,
       error: 'cancelled by sender',
     });
-    this.#inboundFile = null;
+    this.#inbound = null;
   }
 
   /** Fails anything in flight, used when the peer disappears. */
@@ -421,12 +632,12 @@ export class Conversation extends EventTarget {
       pending.resolve();
     }
     this.#pendingAcks.clear();
-    if (this.#inboundFile) {
-      this.#inboundFile.sink.abort();
+    if (this.#inbound) {
+      this.#inbound.sink.abort();
       this.#emit('transfer-error', {
-        id: this.#inboundFile.transferId, name: this.#inboundFile.meta.name, error: reason,
+        id: this.#inbound.transferId, name: this.#inbound.meta.name, error: reason,
       });
-      this.#inboundFile = null;
+      this.#inbound = null;
     }
   }
 }

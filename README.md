@@ -1,6 +1,6 @@
 # LanShare
 
-Send files and text between two browsers on the same LAN.Transfers
+Send files, text, and pasted web pages between two browsers on the same LAN.Transfers
 go directly peer-to-peer over WebRTC, and fall back to relaying through the
 server when a firewall blocks the direct path.
 
@@ -80,6 +80,57 @@ Binding requests on UDP 3478, so each browser also gets a server-reflexive
 candidate carrying its real IP and port as a literal address. No multicast
 involved. STUN is an optimization, never a requirement: if UDP 3478 is blocked,
 ICE falls back to mDNS, and if that fails too the relay still works.
+
+## Pasted pages and formatted text
+
+"Send text" opens an editable box rather than a plain field. Type in it and a
+plain text message is sent, exactly as before. Paste into it from a browser or
+from Word and the formatting comes along: headings, lists, tables, links, and
+images. What the box shows is what the other device will show, so trim the parts
+you do not want before sending.
+
+Images are the reason this is more than a string copy. A page's markup points at
+images by URL, and the receiving device usually cannot reach that server, so on
+paste every image is fetched and embedded into the message as a `data:` URI.
+The result needs nothing from the network, which is what makes it readable on a
+device with no internet at all.
+
+- Up to **2 MB** per image and **24 MB** per message. Anything over that is left
+  out and reported.
+- An image the sender's browser is not allowed to read is left out too, and the
+  composer says how many. This is the browser's cross-origin rule: bytes of an
+  image from another site are only readable when that site permits it, which
+  many image hosts do and many do not.
+- Word images pasted from a local document arrive as `file:` references that no
+  browser will read. Copy the image itself, or a screenshot, to send it.
+- A screenshot on the clipboard can be pasted straight in.
+
+Because embedded images make a message file-sized, formatted text is streamed in
+64 KB chunks over the same path files use, with the same progress and
+backpressure. One over 2 MB asks the receiver to accept it first.
+
+On the receiving side each message appears in **Received text** with buttons to
+copy it with formatting intact, save it as a self-contained `.html` file, and
+look at its markup.
+
+### What stops a pasted page from attacking the other device
+
+Rendering markup somebody else sent is the one place this app handles untrusted
+content, so it does not rely on any single defence.
+
+- The markup is sanitized against an allowlist twice, once by the sender on
+  paste and again by the receiver on arrival. The second pass is the one that
+  matters: the sender's assurance is worth nothing. Scripts, frames, objects,
+  forms, event handler attributes, `javascript:` URLs, and style sheets are all
+  removed.
+- It is then rendered in an `iframe` with neither `allow-scripts` nor
+  `allow-same-origin`, so it runs no code and sits in an opaque origin that
+  cannot see the page around it.
+- That frame carries `default-src 'none'` with images restricted to `data:`.
+  Every image is already embedded, so nothing legitimate needs the network and
+  nothing else gets it. A tracking pixel cannot report that the message was
+  opened.
+- The markup is never inserted into the app's own page, in either direction.
 
 ## Firewall
 

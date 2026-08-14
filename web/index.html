@@ -66,14 +66,19 @@
   </form>
 </dialog>
 
-<!-- Text composer -->
+<!-- Text composer. Editable rather than a textarea so that a paste from a page
+     or from Word keeps its formatting and can be trimmed before sending. -->
 <dialog id="text-dialog" class="dialog">
   <form method="dialog">
     <h3>Send text to <span id="text-target"></span></h3>
-    <textarea id="text-body" rows="6" placeholder="Type or paste anything&hellip;"></textarea>
+    <div id="text-body" class="composer" contenteditable="true" role="textbox"
+         aria-multiline="true" aria-label="Message"
+         data-placeholder="Type, or paste formatted text from a page or Word&hellip;"></div>
+    <p id="text-note" class="composer-note muted small"></p>
     <menu class="dialog-actions">
+      <button type="button" id="text-clear-format" class="button hidden">Clear formatting</button>
       <button value="cancel" class="button">Cancel</button>
-      <button value="send" class="button primary">Send</button>
+      <button value="send" id="text-send" class="button primary">Send</button>
     </menu>
   </form>
 </dialog>
